@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
+    <title>CSVから緯度経度を読み込みマップに表示 (オフライン対応版)</title>
+    
+    <link rel="manifest" href="./manifest.json">
+
+    <script src='./mapbox-gl.js'></script>
+    <script src='./mapbox-gl-language.js'></script>
+    <link href='./mapbox-gl.css' rel='stylesheet'>
+    <script src="./papaparse.min.js"></script>
+    <script src='./mapbox-gl-rtl-text.js'></script> 
+
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 90%;
+            max-width: 400px;
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+        #button, .action-button {
+            display: block;
+            width: 100%;
+            height: 40px;
+            padding: 10px;
+            border: none;
+            border-radius: 3px;
+            font-size: 14px;
+            text-align: center;
+            color: #fff;
+            background: #ee8a65;
+            cursor: pointer;
+            margin-bottom: 5px; 
+        }
+        .action-button {
+            background-color: #4CAF50; 
+        }
+        #address-input-section {
+            margin-top: 10px;
+            width: 100%;
+            display: none; 
+            flex-direction: column;
+            align-items: center;
+        }
+        #address-input {
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 5px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            box-sizing: border-box; 
+        }
+        #info-panel {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            right: 10px;
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            z-index: 1;
+            max-height: 30%;
+            overflow-y: auto;
+        }
+        #info-panel h3 {
+            margin-top: 0;
+            margin-bottom: 8px;
+            color: #333;
+        }
+        #info-panel p {
+            margin-bottom: 5px;
+            color: #555;
+        }
+        .search-button {
+            display: block;
+            width: 100%;
+            padding: 8px;
+            margin-top: 10px;
+            background-color: #007cbf; 
+            color: white;
+            text-align: center;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .search-button:hover {
+            background-color: #00569a;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="controls">
+        <button id="button">現在位置取得</button>
+        <div id="address-input-section">
+            <input type="text" id="address-input" placeholder="住所を入力してください (例: 野々市市本町3丁目)">
+            <button class="action-button" id="set-address-button">住所で現在地を設定</button>
+        </div>
+    </div>
+    
+    <div id="info-panel">
+        <h3>情報</h3>
+        <p id="message">ボタンをタップして現在地を取得し、近い避難所を探しましょう。</p>
+    </div>
+
+    <script>
+        // Service Worker 
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js')
+                    .then((registration) => {
+                        console.log('Service Worker registered: ', registration);
+                        document.getElementById('message').innerText = 'オフラインでも利用可能です。';
+                    })
+                    .catch((error) => {
+                        console.error('Service Worker registration failed: ', error);
+                        document.getElementById('message').innerText = 'Service Workerの登録に失敗しました。オフライン機能が利用できない場合があります。';
+                    });
+            });
+        }
+
+        mapboxgl.accessToken = 'pk.eyJ1IjoieWFtYWRhaGluYXRhIiwiYSI6ImNtNHJ2ZWF3ZTA4cmMyaXNidzZrYXF4YnYifQ.r62l_TQuQnDOcM3_JfhnEQ'; 
+        
+       const map = new mapboxgl.Map({
+            container: 'map',
+            style: 'mapbox://styles/mapbox/streets-v11',
+            center: [136.66240338447, 36.562140121241],
+            zoom: 15
+        });
+
+        mapboxgl.setRTLTextPlugin('./mapbox-gl-rtl-text.js');
+        map.addControl(new MapboxLanguage({
+            defaultLanguage: 'ja'
+        }));
+
+        map.on('style.load', function() {
+            if (map.getLayer('poi-label')) map.setLayoutProperty('poi-label', 'visibility', 'none');
+            if (map.getLayer('road-label')) map.setLayoutProperty('road-label', 'visibility', 'none');
+            if (map.getLayer('natural-label')) map.setLayoutProperty('natural-label', 'visibility', 'none');
+            if (map.getLayer('water-label')) map.setLayoutProperty('water-label', 'visibility', 'none');
+        });
+
+        let places = []; // 避難所データを格納する配列
+        let currentMarker = null; // 現在地のマーカーを保持するための変数
+        let selectedShelterName = ''; // 選択された避難所の名前を保持する変数
+        let currentPositionCoords = null; // 現在地の緯度経度を保持する変数
+
+        const addressInputSection = document.getElementById('address-input-section');
+        const addressInput = document.getElementById('address-input');
+        const setAddressButton = document.getElementById('set-address-button');
+
+        // CSVデータを非同期で読み込む関数
+        async function loadCSV() {
+            try {
+                const response = await fetch('hinannjyo.csv'); // ローカルのCSVファイルのパス
+                const csv = await response.text();
+                Papa.parse(csv, {
+                    header: true,
+                    encoding: "UTF-8", 
+                    complete: function(results) {
+                        console.log("CSV raw data:", results.data); 
+
+                        places = results.data.map(row => ({
+                            name: row['name'],
+                            address: row['address'],
+                            coordinates: [parseFloat(row['longitude']), parseFloat(row['latitude'])]
+                        })).filter(place => 
+                            !isNaN(place.coordinates[0]) && !isNaN(place.coordinates[1]) &&
+                            place.coordinates[0] !== 0 && place.coordinates[1] !== 0 
+                        );
+
+                        console.log("Parsed places:", places); 
+
+                        if (map.getLayer('places')) {
+                            map.removeLayer('places');
+                        }
+                        if (map.getSource('places')) {
+                            map.removeSource('places');
+                        }
+
+                        // 避難所データを地図に追加
+                        map.addSource('places', {
+                            'type': 'geojson',
+                            'data': {
+                                'type': 'FeatureCollection',
+                                'features': places.map(place => ({
+                                    'type': 'Feature',
+                                    'properties': {
+                                        'description': `<strong>${place.name}</strong><p>${place.address}</p>`,
+                                        'name': place.name, 
+                                        'address': place.address 
+                                    },
+                                    'geometry': {
+                                        'type': 'Point',
+                                        'coordinates': place.coordinates
+                                    }
+                                }))
+                            }
+                        });
+
+                        map.addLayer({
+                            'id': 'places',
+                            'type': 'circle', 
+                            'source': 'places',
+                            'paint': {
+                                'circle-color': '#007cbf', 
+                                'circle-radius': 8,
+                                'circle-stroke-width': 1,
+                                'circle-stroke-color': '#ffffff'
+                            }
+                        });
+
+                        map.on('click', 'places', function (e) {
+                            const coordinates = e.features[0].geometry.coordinates.slice();
+                            const { name, address } = e.features[0].properties; 
+
+                            new mapboxgl.Popup()
+                                .setLngLat(coordinates)
+                                .setHTML(`<strong>${name}</strong><p>${address}</p>`)
+                                .addTo(map);
+
+                            // 情報パネル更新
+                            selectedShelterName = name; 
+                            document.getElementById('message').innerHTML = 
+                                `<h3>選択された避難所:</h3>
+                                <p>名称: ${name}</p>
+                                <p>住所: ${address}</p>
+                                <button class="search-button" onclick="searchShelterOnWeb('${encodeURIComponent(name)}')">ウェブで検索</button>`; 
+                        });
+
+                        map.on('mouseenter', 'places', function () {
+                            map.getCanvas().style.cursor = 'pointer';
+                        });
+                        map.on('mouseleave', 'places', function () {
+                            map.getCanvas().style.cursor = '';
+                        });
+                    }
+                });
+            } catch (error) {
+                console.error('CSVファイルの読み込みに失敗しました:', error);
+                document.getElementById('message').innerText = '避難所データの読み込みに失敗しました。';
+            }
+        }
+
+        // 現在地マーカーを地図に設定する共通関数
+        function setCurrentLocationOnMap(lng, lat) {
+            currentPositionCoords = [lng, lat];
+            map.flyTo({ center: currentPositionCoords, zoom: 15 });
+
+            if (currentMarker) {
+                currentMarker.remove();
+            }
+
+            currentMarker = new mapboxgl.Marker({ color: 'red' })
+                .setLngLat(currentPositionCoords)
+                .addTo(map);
+
+            updateShelterDistances(currentPositionCoords);
+        }
+
+        // 避難所との距離を計算し情報パネルを更新する関数
+        function updateShelterDistances(coords) {
+            const sortedShelters = places.map(shelter => ({
+                ...shelter,
+                distance: calculateDistance(coords, shelter.coordinates)
+            })).sort((a, b) => a.distance - b.distance);
+
+            const closestShelters = sortedShelters.slice(0, 4);
+            let closestInfoHTML = '<h3>現在地周辺の避難所:</h3>';
+            closestShelters.forEach(shelter => {
+                closestInfoHTML += `<p><strong>${shelter.name}</strong> (${shelter.distance.toFixed(2)} km)</p>`;
+            });
+            document.getElementById('message').innerHTML = closestInfoHTML;
+
+            if (selectedShelterName) {
+                document.getElementById('message').innerHTML += 
+                    `<button class="search-button" onclick="searchShelterOnWeb('${encodeURIComponent(selectedShelterName)}')">選択避難所をウェブで検索</button>`;
+            }
+        }
+
+        // 現在位置取得ボタン
+        document.getElementById('button').onclick = () => {
+            document.getElementById('message').innerText = '現在地を取得中...';
+            // 住所入力欄を非表示
+            addressInputSection.style.display = 'none';
+
+            navigator.geolocation.getCurrentPosition(geoSuccess, geoError, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
+
+            function geoSuccess(position) {
+                const lat = position.coords.latitude;
+                const lng = position.coords.longitude;
+                document.getElementById('message').innerText = '現在地を取得しました。';
+                setCurrentLocationOnMap(lng, lat);
+            }
+
+            function geoError(error) {
+                console.error("位置情報取得失敗:", error);
+                let errorMessage;
+                switch (error.code) {
+                    case error.PERMISSION_DENIED:
+                        errorMessage = "位置情報へのアクセスが拒否されました。";
+                        break;
+                    case error.POSITION_UNAVAILABLE:
+                        errorMessage = "位置情報が利用できません。";
+                        break;
+                    case error.TIMEOUT:
+                        errorMessage = "位置情報の取得がタイムアウトしました。";
+                        break;
+                    default:
+                        errorMessage = "不明なエラーが発生しました。";
+                }
+                document.getElementById('message').innerText = `位置情報取得失敗: ${errorMessage} 手動で住所を入力できます。`;
+                // 位置情報取得失敗時に住所入力欄を表示
+                addressInputSection.style.display = 'flex';
+            }
+        }
+
+        // 住所で現在地を設定ボタン
+        setAddressButton.onclick = async () => {
+            const address = addressInput.value.trim();
+            if (!address) {
+                alert('住所を入力してください。');
+                return;
+            }
+
+            document.getElementById('message').innerText = '住所を検索中...';
+            const geocodingUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(address)}.json?access_token=${mapboxgl.accessToken}&language=ja&country=JP`;
+
+            try {
+                const response = await fetch(geocodingUrl);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+
+                if (data.features && data.features.length > 0) {
+                    const coords = data.features[0].geometry.coordinates; 
+                    document.getElementById('message').innerText = `「${address}」の場所を設定しました。`;
+                    setCurrentLocationOnMap(coords[0], coords[1]);
+                    addressInputSection.style.display = 'none'; 
+                } else {
+                    document.getElementById('message').innerText = `「${address}」の場所が見つかりませんでした。`;
+                    alert('指定された住所の場所が見つかりませんでした。より具体的な住所をお試しください。');
+                }
+            } catch (error) {
+                console.error('住所検索に失敗しました:', error);
+                document.getElementById('message').innerText = `住所検索に失敗しました。インターネット接続を確認してください。`;
+                alert('住所検索に失敗しました。この機能はオンラインでのみ利用可能です。インターネット接続を確認してください。');
+            }
+        };
+
+
+        // 2点間の距離を計算
+        function calculateDistance(coord1, coord2) {
+            const R = 6371; // 地球の半径 (km)
+            const dLat = (coord2[1] - coord1[1]) * Math.PI / 180; // 緯度の差をラジアンに
+            const dLon = (coord2[0] - coord1[0]) * Math.PI / 180; // 経度の差をラジアンに
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                      Math.cos(coord1[1] * Math.PI / 180) * Math.cos(coord2[1] * Math.PI / 180) *
+                      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c; 
+        }
+
+        // ウェブ検索実行関数
+        function searchShelterOnWeb(encodedShelterName) {
+            const decodedShelterName = decodeURIComponent(encodedShelterName);
+            // Google検索のURL生成
+            const searchUrl = `https://www.google.com/search?q=${encodedShelterName} 避難所`;
+            window.open(searchUrl, '_blank');
+        }
+
+
+        // 起動時にCSVデータを読み込む
+        map.on('load', loadCSV); 
+    </script>
+</body>
+</html>
